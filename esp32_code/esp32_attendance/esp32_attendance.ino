@@ -224,33 +224,41 @@ void screenIdle() {
 //  SCREEN: Face detected — show name + confidence
 // ═══════════════════════════════════════════════════════════════════
 void screenFace() {
-  tft.fillScreen(C_BG);
+  tft.fillScreen(C_BG);                          // clear entire screen first
   drawHeader("Face Detected", C_GREEN);
 
   int cx = 240;
 
+  // Panel background — drawn before any text so text has a solid base
   tft.fillRoundRect(40, 52, 400, 200, 14, 0x0040);
   tft.drawRoundRect(40, 52, 400, 200, 14, C_GREEN);
 
+  // Tick mark inside panel
   for (int t = -2; t <= 2; t++) {
     tft.drawLine(cx-52+t, 148, cx-12+t, 196, C_GREEN);
     tft.drawLine(cx-12+t, 196, cx+60+t, 116, C_GREEN);
   }
 
-  tft.setTextColor(C_GREEN);
+  // Label — bg matches panel color so no ghost pixels if text changes
+  tft.setTextColor(C_GREEN, 0x0040);
   tft.setTextDatum(MC_DATUM);
   tft.drawString("Face Recognised!", cx, 208, 2);
 
-  tft.setTextColor(C_WHITE);
+  // Name — clear old name pixels automatically via bg color
+  tft.fillRect(40, 216, 400, 30, 0x0040);        // explicit clear for variable-length name
+  tft.setTextColor(C_WHITE, 0x0040);
   tft.drawString(recognizedName.c_str(), cx, 228, 4);
 
-  // [FIX 2] Multiply by 100 — confidence from server is 0.0-1.0
+  // Confidence — bg=C_BG because y=260 is below the panel (panel ends y=252)
+  tft.fillRect(40, 252, 400, 20, C_BG);          // clear the gap area
   String confStr = "Confidence: " + String((int)(recognizedConf * 100)) + "%";
-  tft.setTextColor(C_GRAY);
-  tft.drawString(confStr.c_str(), cx, 260, 2);
+  tft.setTextColor(C_GRAY, C_BG);
+  tft.drawString(confStr.c_str(), cx, 262, 2);
 
-  tft.setTextColor(C_YELLOW);
-  tft.drawString("Marking attendance...", cx, 286, 2);
+  // Fingerprint prompt — replaces old "Marking attendance..."
+  tft.setTextColor(C_YELLOW, C_BG);
+  tft.drawString("Place your finger on the", cx, 284, 2);
+  tft.drawString("fingerprint scanner", cx, 304, 2);
   tft.setTextDatum(TL_DATUM);
 }
 
@@ -270,10 +278,11 @@ void screenNotFound() {
     tft.drawLine(cx+52+t, cy-52, cx-52+t, cy+52, C_RED);
   }
 
-  tft.setTextColor(C_RED);
+  // bg=0x2000 for text inside panel, bg=C_BG outside
+  tft.setTextColor(C_RED, 0x2000);
   tft.setTextDatum(MC_DATUM);
   tft.drawString("Face Not Registered", cx, cy + 68, 4);
-  tft.setTextColor(C_GRAY);
+  tft.setTextColor(C_GRAY, C_BG);
   tft.drawString("Please enroll at http://" + String(SERVER_IP) + ":5000", cx, cy + 102, 1);
   tft.drawString("Returning to scan...", cx, cy + 120, 1);
   tft.setTextDatum(TL_DATUM);
@@ -286,10 +295,11 @@ void screenMarking() {
   tft.fillScreen(C_BG);
   drawHeader("Marking Attendance", C_YELLOW);
 
-  tft.setTextColor(C_WHITE);
+  tft.setTextColor(C_WHITE, C_BG);               // bg=C_BG prevents ghost text
   tft.setTextDatum(MC_DATUM);
   tft.drawString("Please wait...", 240, 150, 4);
-  tft.setTextColor(C_YELLOW);
+  tft.fillRect(40, 184, 400, 22, C_BG);          // clear name area before drawing
+  tft.setTextColor(C_YELLOW, C_BG);
   tft.drawString(recognizedName.c_str(), 240, 196, 2);
   tft.setTextDatum(TL_DATUM);
 }
@@ -303,6 +313,7 @@ void screenConfirmed() {
 
   int cx = 240;
 
+  // Panel: y=52 to y=280 (52+228)
   tft.fillRoundRect(20, 52, 440, 228, 16, 0x0050);
   tft.drawRoundRect(20, 52, 440, 228, 16, C_GREEN);
   tft.drawRoundRect(22, 54, 436, 224, 16, 0x00A0);
@@ -316,24 +327,29 @@ void screenConfirmed() {
     tft.drawLine(sx-6+t,  sy+52, sx+28+t,sy+22,  0x0050);
   }
 
-  tft.setTextColor(C_GREEN);
+  // All text inside panel uses bg=0x0050 so no ghost pixels
+  tft.setTextColor(C_GREEN, 0x0050);
   tft.setTextDatum(MC_DATUM);
   tft.drawString("Attendance Recorded", cx, 172, 2);
   tft.drawFastHLine(60, 194, 360, C_GREEN);
 
-  tft.setTextColor(C_WHITE);
+  // Name — explicit clear + bg color to remove any old longer name
+  tft.fillRect(20, 190, 440, 28, 0x0050);
+  tft.setTextColor(C_WHITE, 0x0050);
   tft.drawString(recognizedName.c_str(), cx, 203, 4);
 
-  tft.setTextColor(C_GREEN);
-  tft.drawString("Verified via Face Recognition  ✓", cx, 240, 2);
+  tft.setTextColor(C_GREEN, 0x0050);
+  tft.drawString("Verified via Face Recognition  ", cx, 240, 2);
 
   if (ttCount > 0) {
-    tft.setTextColor(C_BLUE);
-    tft.drawString("Loading timetable...", cx, 266, 2);
+    tft.setTextColor(C_BLUE, 0x0050);
+    tft.drawString("Loading timetable...", cx, 262, 2);
   }
 
-  tft.setTextColor(C_GRAY);
-  tft.drawString("Section " + ttSection + "  |  " + ttDay, cx, 288, 1);
+  // y=288 is outside panel (panel ends y=280) — bg=C_BG
+  tft.setTextColor(C_GRAY, C_BG);
+  tft.fillRect(20, 282, 440, 14, C_BG);          // clear below panel
+  tft.drawString("Section " + ttSection + "  |  " + ttDay, cx, 290, 1);
   tft.setTextDatum(TL_DATUM);
 }
 
@@ -343,25 +359,27 @@ void screenConfirmed() {
 void screenTimetable() {
   tft.fillScreen(C_BG);
 
+  // Header bar — bg=C_SURF for all text drawn on it
   tft.fillRect(0, 0, 480, 46, C_SURF);
   tft.drawFastHLine(0, 46, 480, C_BLUE);
-  tft.setTextColor(C_BLUE);
+  tft.setTextColor(C_BLUE, C_SURF);
   tft.drawString("Today's Timetable", 10, 8, 2);
   String sub = ttDay + "  |  Sec " + ttSection + "  |  " + recognizedName.substring(0,18);
-  tft.setTextColor(C_GRAY);
+  tft.setTextColor(C_GRAY, C_SURF);
   tft.drawString(sub.c_str(), 10, 30, 1);
   tft.fillCircle(466, 22, 7, C_GREEN);
 
   if (ttCount == 0) {
-    tft.setTextColor(C_GRAY);
+    tft.setTextColor(C_GRAY, C_BG);
     tft.setTextDatum(MC_DATUM);
     tft.drawString("No classes today!", 240, 180, 4);
     tft.setTextDatum(TL_DATUM);
     return;
   }
 
+  // Column header bar
   tft.fillRect(0, 47, 480, 18, C_SURF2);
-  tft.setTextColor(C_GRAY);
+  tft.setTextColor(C_GRAY, C_SURF2);
   tft.drawString("Per  Time",   8,   51, 1);
   tft.drawString("Subject",    148,  51, 1);
   tft.drawString("Teacher",    310,  51, 1);
@@ -375,24 +393,24 @@ void screenTimetable() {
 
   for (int i = 0; i < maxRows; i++) {
     uint16_t bg = (i % 2 == 0) ? 0x080A : C_BG;
-    tft.fillRect(0, y, 480, rowH-1, bg);
+    tft.fillRect(0, y, 480, rowH-1, bg);          // fill row bg first
 
     uint16_t stripe = stripeColors[i % 6];
     tft.fillRect(0, y, 5, rowH-1, stripe);
 
     tft.fillRoundRect(8, y+6, 28, rowH-14, 4, stripe);
-    tft.setTextColor(C_BG, stripe);
+    tft.setTextColor(C_BG, stripe);               // period pill — bg=stripe
     tft.setTextDatum(MC_DATUM);
     tft.drawString(tt[i].label.c_str(), 22, y+rowH/2, 1);
     tft.setTextDatum(TL_DATUM);
 
-    tft.setTextColor(C_GRAY, bg);
+    tft.setTextColor(C_GRAY, bg);                 // time
     tft.drawString(tt[i].time.c_str(), 42, y+6, 1);
 
-    tft.setTextColor(C_WHITE, bg);
+    tft.setTextColor(C_WHITE, bg);                // subject
     tft.drawString(tt[i].subject.substring(0,18).c_str(), 148, y+6, 2);
 
-    tft.setTextColor(C_GRAY, bg);
+    tft.setTextColor(C_GRAY, bg);                 // teacher
     tft.drawString(tt[i].teacher.substring(0,24).c_str(), 310, y+6, 1);
 
     tft.drawFastHLine(0, y+rowH-1, 480, C_SURF);
@@ -400,11 +418,13 @@ void screenTimetable() {
   }
 
   tft.drawFastHLine(0, y+2, 480, C_SURF);
-  tft.setTextColor(C_BLUE);
+  tft.setTextColor(C_BLUE, C_BG);
   tft.drawString(String(min(ttCount,3)) + "/" + String(ttCount) + " periods shown", 8, y+6, 1);
-  tft.setTextColor(C_GRAY);
-  tft.setTextDatum(MC_DATUM);
 
+  // Countdown — drawn once here; loop updates it every second
+  tft.fillRect(0, 298, 480, 22, C_BG);            // clear full-width countdown row
+  tft.setTextColor(C_GRAY, C_BG);
+  tft.setTextDatum(MC_DATUM);
   unsigned long secLeft = (TIMETABLE_MS - inState()) / 1000;
   tft.drawString("Auto-reset in " + String(secLeft) + "s", 240, 308, 1);
   tft.setTextDatum(TL_DATUM);
@@ -684,10 +704,14 @@ void loop() {
       }
       break;
 
-    case S_TIMETABLE:
-      if ((now / 1000) != ((now - 50) / 1000)) {
+    case S_TIMETABLE: {
+      // Update countdown exactly once per second using a static tracker
+      static unsigned long lastTTSec = 0;
+      unsigned long curSec = millis() / 1000;
+      if (curSec != lastTTSec) {
+        lastTTSec = curSec;
         unsigned long secLeft = (TIMETABLE_MS - inState()) / 1000;
-        tft.fillRect(100, 302, 280, 14, C_BG);
+        tft.fillRect(0, 298, 480, 22, C_BG);      // full-width clear, same as initial draw
         tft.setTextColor(C_GRAY, C_BG);
         tft.setTextDatum(MC_DATUM);
         tft.drawString("Auto-reset in " + String(secLeft) + "s", 240, 308, 1);
