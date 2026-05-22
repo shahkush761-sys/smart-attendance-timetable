@@ -1,32 +1,40 @@
 /*
  * ╔══════════════════════════════════════════════════════════════╗
- * ║   ESP32-S3 + ILI9488 480×320 TFT — FaceGuard v1.4 (FINAL)  ║
+ * ║   ESP32-S3 + ILI9488 480×320 TFT — FaceGuard v1.6 (FINAL)  ║
  * ╠══════════════════════════════════════════════════════════════╣
- * ║  ROOT CAUSE OF ALL OVERLAPS (found in v1.3 → fixed here):   ║
+ * ║  TWO ROOT CAUSES FIXED:                                      ║
  * ║                                                              ║
- * ║  setTextDatum(MC_DATUM) was active, which means the Y        ║
- * ║  passed to drawString() is the TEXT CENTER, not the top.     ║
- * ║  But clearText() was treating Y as the TOP → fillRect()      ║
- * ║  cleared the WRONG area every time, always missing the       ║
- * ║  upper half of the previous glyph → ghost pixels remained.  ║
+ * ║  [SW] clearText() y-coordinate mismatch                      ║
+ * ║       setTextDatum(MC_DATUM) → y in drawString() = CENTER.   ║
+ * ║       All previous versions passed (drawString_y - 4) to    ║
+ * ║       clearText(), so fillRect missed the top 6-8 px of      ║
+ * ║       every glyph → ghost pixels remained after every redraw.║
+ * ║       FIX: pass the SAME y to both clearText() & drawString()║
+ * ║       clearText() now offsets fillRect up by halfH itself.   ║
  * ║                                                              ║
- * ║  FIX: clearText() now treats Y as the CENTER (MC_DATUM)     ║
- * ║  and offsets fillRect up by h/2 so it covers the full glyph.║
- * ║  Same Y value is passed to BOTH clearText() and drawString() ║
- * ║  so they always clear and draw in the same spot.             ║
+ * ║  [HW] WiFi EMI / SPI bus interruption                        ║
+ * ║       ESP32 WiFi TX bursts can interrupt a long SPI write    ║
+ * ║       mid-frame. ILI9488 aborts silently → partial clear     ║
+ * ║       leaving old content visible.                           ║
+ * ║       FIX 1: esp_wifi_set_ps(WIFI_PS_NONE) → disables WiFi  ║
+ * ║         modem-sleep; power draw becomes steady, no bursts.   ║
+ * ║       FIX 2: wipeScreen() clears in 8 short bands, each      ║
+ * ║         wrapped in startWrite/endWrite (≈17ms each) → too    ║
+ * ║         short for a WiFi burst to abort.                     ║
+ * ║       FIX 3: SPI frequency lowered to 20 MHz (was 27 MHz).  ║
+ * ║         Update User_Setup.h: SPI_FREQUENCY 20000000          ║
  * ║                                                              ║
- * ║  PIN CONFIG (goes in TFT_eSPI User_Setup.h):                 ║
+ * ║  PIN CONFIG (User_Setup.h in TFT_eSPI library):              ║
  * ║    #define ILI9488_DRIVER                                    ║
  * ║    #define USE_FSPI_PORT                                     ║
- * ║    #define TFT_MOSI  11   #define TFT_MISO  13              ║
- * ║    #define TFT_SCLK  12   #define TFT_CS    10              ║
- * ║    #define TFT_DC     9   #define TFT_RST    8              ║
- * ║    #define TFT_BL    46   #define TFT_BACKLIGHT_ON HIGH     ║
- * ║    #define SPI_FREQUENCY  27000000                           ║
+ * ║    #define TFT_MOSI 11    #define TFT_MISO 13               ║
+ * ║    #define TFT_SCLK 12    #define TFT_CS   10               ║
+ * ║    #define TFT_DC    9    #define TFT_RST   8               ║
+ * ║    #define TFT_BL   46    #define TFT_BACKLIGHT_ON HIGH      ║
+ * ║    #define SPI_FREQUENCY  20000000   ← CHANGED from 27MHz   ║
  * ╚══════════════════════════════════════════════════════════════╝
  */
 
-// ── FS first — fixes WebServer/FS namespace on ESP32 core 3.x ────
 #include <FS.h>
 using fs::FS;
 #include <WiFi.h>
@@ -34,6 +42,7 @@ using fs::FS;
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
+#include <esp_wifi.h>          // for esp_wifi_set_ps()
 
 // ═══════════════════════════════════════════════════════════════════
 //  ▶▶  EDIT THESE  ◀◀
@@ -68,24 +77,27 @@ using fs::FS;
 #define C_GRAY         0x8C17
 #define C_DGRAY        0x2104
 
-// Panel tones — MUST exactly match fillRoundRect() fill colour
+// Panel tones — must exactly match fillRoundRect() fill colour
 #define C_PANEL_BLUE   0x0040
 #define C_PANEL_RED    0x2000
 #define C_PANEL_GREEN  0x0050
 
 // ═══════════════════════════════════════════════════════════════════
-//  FONT HALF-HEIGHTS (used by clearText to offset fillRect)
-//  TFT_eSPI built-in fonts:  Font1=8px  Font2=16px  Font4=26px
-//  Half-height = pixel height / 2, rounded up, + 2px safety margin
+//  FONT HALF-HEIGHTS for clearText()
+//  TFT_eSPI built-in:  Font1=8px  Font2=16px  Font4=26px
+//  halfH = ceil(px/2) + 2px safety margin
 // ═══════════════════════════════════════════════════════════════════
-#define FHH1   6    // half-height of font 1  (8/2 + 2)
-#define FHH2  10    // half-height of font 2  (16/2 + 2)
-#define FHH4  15    // half-height of font 4  (26/2 + 2)
+#define HALFH1   6    //  8px / 2 + 2
+#define HALFH2  10    // 16px / 2 + 2
+#define HALFH4  15    // 26px / 2 + 2
 
-// Full height for the fillRect (2× half + 2px bottom pad)
-#define FH1   (FHH1*2 + 2)
-#define FH2   (FHH2*2 + 2)
-#define FH4   (FHH4*2 + 2)
+// ═══════════════════════════════════════════════════════════════════
+//  DISPLAY GEOMETRY / WIPE BANDS
+// ═══════════════════════════════════════════════════════════════════
+#define DISP_W     480
+#define DISP_H     320
+#define WIPE_BANDS   8          // 8 × 40 px = 320 px
+#define BAND_H     (DISP_H / WIPE_BANDS)  // 40 px ≈ 17 ms @20MHz
 
 // ═══════════════════════════════════════════════════════════════════
 //  STATE MACHINE
@@ -126,36 +138,51 @@ void          setState(State s) { state = s; stateTs = millis(); }
 unsigned long inState()         { return millis() - stateTs; }
 
 /*
- * clearText() — THE CORE FIX
+ * wipeScreen() — [HW FIX 2]
+ * Clears the display in 8 short horizontal bands instead of one
+ * giant fillScreen(). Each band is ~17ms @20MHz — short enough
+ * that a WiFi interrupt cannot abort it. yield() between bands
+ * lets the WiFi stack process pending work without corrupting SPI.
+ */
+void wipeScreen() {
+  for (int b = 0; b < WIPE_BANDS; b++) {
+    tft.startWrite();
+    tft.fillRect(0, b * BAND_H, DISP_W, BAND_H, C_BG);
+    tft.endWrite();
+    yield();
+  }
+}
+
+/*
+ * clearText() — [SW FIX]
  * ─────────────────────────────────────────────────────────────────
  * Call BEFORE drawString() for any variable-length text.
  *
- * IMPORTANT: Y is the MC_DATUM centre coordinate — the same value
- * you will pass to drawString().  The fillRect is offset UPWARD by
- * half the font height so it covers the full glyph (top + bottom).
+ * KEY RULE: pass the EXACT SAME y to clearText() that you pass to
+ * drawString(). Both use MC_DATUM so y = the TEXT CENTRE.
+ * clearText() offsets the fillRect upward by halfH internally,
+ * so it covers the full glyph (both above and below the centre).
  *
- *   x, yCenter : same coordinates you pass to drawString()
- *   w          : width to erase (panel width or 480 for full-screen)
+ *   x, yCenter : same values you pass to drawString()
+ *   w          : width to erase (panel width or DISP_W)
  *   font       : 1 / 2 / 4 — must match drawString() font arg
  *   bg         : background colour behind the text
  */
 void clearText(int x, int yCenter, int w, int font, uint16_t bg) {
-  int hh = (font == 4) ? FHH4 : (font == 2) ? FHH2 : FHH1;
-  int h  = hh * 2 + 2;
-  // fillRect from (yCenter - halfHeight - 1) so the full glyph is wiped
-  tft.fillRect(x, yCenter - hh - 1, w, h, bg);
+  int hh = (font == 4) ? HALFH4 : (font == 2) ? HALFH2 : HALFH1;
+  // fillRect from (yCenter - hh) with height (hh*2) → covers full glyph
+  tft.fillRect(x, yCenter - hh, w, hh * 2, bg);
 }
 
-// Header bar — always redrawn from scratch; bg=C_SURF prevents bleed
+// Header bar — always redrawn from scratch; 2-arg setTextColor keeps bg clean
 void drawHeader(const char* title, uint16_t col) {
-  tft.fillRect(0, 0, 480, 44, C_SURF);
-  tft.drawFastHLine(0, 44, 480, col);
+  tft.fillRect(0, 0, DISP_W, 44, C_SURF);
+  tft.drawFastHLine(0, 44, DISP_W, col);
   tft.fillCircle(18, 22, 9, col);
   tft.fillCircle(18, 22, 4, C_SURF);
-  tft.setTextColor(col, C_SURF);       // 2-arg — bg = C_SURF
+  tft.setTextColor(col, C_SURF);          // 2-arg: bg = C_SURF
   tft.drawString(title, 34, 13, 2);
-  bool ok = (WiFi.status() == WL_CONNECTED);
-  tft.fillCircle(466, 22, 7, ok ? C_GREEN : C_RED);
+  tft.fillCircle(466, 22, 7, (WiFi.status() == WL_CONNECTED) ? C_GREEN : C_RED);
 }
 
 String buildURL(const char* path) {
@@ -166,17 +193,16 @@ String buildURL(const char* path) {
 //  SCREEN: WiFi Connecting
 // ═══════════════════════════════════════════════════════════════════
 void screenWifi() {
-  tft.fillScreen(C_BG);
-  tft.fillRect(0, 0, 480, 5, C_BLUE);
+  wipeScreen();
+  tft.fillRect(0, 0, DISP_W, 5, C_BLUE);
 
   int cx = 240, cy = 130;
-  for (int r = 14; r <= 60; r += 14) {
+  for (int r = 14; r <= 60; r += 14)
     for (int a = 210; a <= 330; a += 2) {
-      float rad = a * PI / 180.0;
+      float rad = a * PI / 180.0f;
       tft.drawPixel(cx + (int)(r * cos(rad)), cy + (int)(r * sin(rad)),     C_BLUE);
       tft.drawPixel(cx + (int)(r * cos(rad)), cy + (int)(r * sin(rad)) - 1, C_BLUE);
     }
-  }
   tft.fillCircle(cx, cy, 7, C_BLUE);
 
   tft.setTextDatum(MC_DATUM);
@@ -188,9 +214,11 @@ void screenWifi() {
   tft.setTextDatum(TL_DATUM);
 }
 
-// Clears the dot row and redraws — full 480 px width prevents ghosts
+// Updates just the animated dot row without redrawing the whole screen
 void updateWifiDots(int dotCount) {
-  tft.fillRect(0, 230, 480, 35, C_BG);
+  tft.startWrite();
+  tft.fillRect(0, 230, DISP_W, 35, C_BG);  // clear full width
+  tft.endWrite();
   tft.setTextColor(C_BLUE, C_BG);
   tft.setTextDatum(MC_DATUM);
   String dotStr = "";
@@ -201,14 +229,14 @@ void updateWifiDots(int dotCount) {
 
 // ═══════════════════════════════════════════════════════════════════
 //  SCREEN: Idle
-//  Static text only — drawn once after fillScreen.
-//  Info text in BOTTOM CORNERS so it never overlaps face panels.
+//  Static text only — drawn once after wipeScreen().
+//  Info text in bottom corners so it never overlaps face panels.
 // ═══════════════════════════════════════════════════════════════════
 void screenIdle() {
-  tft.fillScreen(C_BG);                      // wipes every previous screen
+  wipeScreen();
   drawHeader("FaceGuard  ·  Smart Attendance", C_BLUE);
 
-  int cx = 240, cy = 155;
+  int cx = 240, cy = 148;
 
   // Camera icon
   tft.fillRoundRect(cx - 80, cy - 52, 160, 110, 14, C_SURF);
@@ -221,14 +249,14 @@ void screenIdle() {
   tft.fillRoundRect(cx - 24, cy - 63, 48, 16, 7, C_SURF);
   tft.drawRoundRect(cx - 24, cy - 63, 48, 16, 7, C_BLUE);
 
-  // Instruction — centred below icon (static, drawn once)
+  // Static instruction text — drawn once, no variable content
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(C_WHITE, C_BG);
-  tft.drawString("Please stand in front of the camera", cx, 230, 2);
+  tft.drawString("Please stand in front of the camera", cx, 220, 2);
   tft.setTextColor(C_BLUE, C_BG);
-  tft.drawString("System Ready  |  Polling server", cx, 256, 2);
+  tft.drawString("System Ready  —  Polling server", cx, 244, 2);
 
-  // Server IP — bottom-LEFT corner
+  // Server info — bottom-LEFT corner (small, static)
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(C_GREEN, C_BG);
   tft.drawString(String(SERVER_IP) + ":" + SERVER_PORT, 6, 304, 1);
@@ -236,7 +264,7 @@ void screenIdle() {
   // Version — bottom-RIGHT corner
   tft.setTextDatum(TR_DATUM);
   tft.setTextColor(C_DGRAY, C_BG);
-  tft.drawString("FaceGuard v1.4  |  DSCE", 474, 304, 1);
+  tft.drawString("FaceGuard v1.6  |  DSCE", 474, 304, 1);
   tft.setTextDatum(TL_DATUM);
 }
 
@@ -244,15 +272,13 @@ void screenIdle() {
 //  SCREEN: Face Detected
 // ═══════════════════════════════════════════════════════════════════
 void screenFace() {
-  tft.fillScreen(C_BG);
+  wipeScreen();
   drawHeader("Face Detected", C_GREEN);
   int cx = 240;
 
-  // Panel: y=52 … y=252
+  // Panel y=52…252
   tft.fillRoundRect(40, 52, 400, 200, 14, C_PANEL_BLUE);
   tft.drawRoundRect(40, 52, 400, 200, 14, C_GREEN);
-
-  // Checkmark
   for (int t = -2; t <= 2; t++) {
     tft.drawLine(cx - 52 + t, 148, cx - 12 + t, 196, C_GREEN);
     tft.drawLine(cx - 12 + t, 196, cx + 60 + t, 116, C_GREEN);
@@ -260,23 +286,23 @@ void screenFace() {
 
   tft.setTextDatum(MC_DATUM);
 
-  // "Face Recognised!" — font 2, y=208 centre, panel bg
+  // "Face Recognised!" — font 2, y=208 (SAME y for clear and draw)
   clearText(40, 208, 400, 2, C_PANEL_BLUE);
   tft.setTextColor(C_GREEN, C_PANEL_BLUE);
   tft.drawString("Face Recognised!", cx, 208, 2);
 
-  // Name — font 4, y=230 centre, panel bg
-  clearText(40, 230, 400, 4, C_PANEL_BLUE);
+  // Name — font 4, y=232 (SAME y for clear and draw)
+  clearText(40, 232, 400, 4, C_PANEL_BLUE);
   tft.setTextColor(C_WHITE, C_PANEL_BLUE);
-  tft.drawString(recognizedName.c_str(), cx, 230, 4);
+  tft.drawString(recognizedName.c_str(), cx, 232, 4);
 
-  // Confidence — font 2, y=262 centre, below panel → bg=C_BG
+  // Confidence — font 2, y=262, below panel → bg=C_BG
   String confStr = "Confidence: " + String((int)(recognizedConf * 100)) + "%";
   clearText(40, 262, 400, 2, C_BG);
   tft.setTextColor(C_GRAY, C_BG);
   tft.drawString(confStr.c_str(), cx, 262, 2);
 
-  // Fingerprint prompt — font 2, below panel → bg=C_BG
+  // Fingerprint prompt — font 2, y=284 and y=304
   clearText(40, 284, 400, 2, C_BG);
   tft.setTextColor(C_YELLOW, C_BG);
   tft.drawString("Place your finger on the", cx, 284, 2);
@@ -291,15 +317,12 @@ void screenFace() {
 //  SCREEN: Not Registered
 // ═══════════════════════════════════════════════════════════════════
 void screenNotFound() {
-  tft.fillScreen(C_BG);
+  wipeScreen();
   drawHeader("Not Registered", C_RED);
   int cx = 240, cy = 172;
 
-  // Panel: y=52 … y=272
   tft.fillRoundRect(40, 52, 400, 220, 14, C_PANEL_RED);
   tft.drawRoundRect(40, 52, 400, 220, 14, C_RED);
-
-  // X mark
   for (int t = -2; t <= 2; t++) {
     tft.drawLine(cx - 52 + t, cy - 52, cx + 52 + t, cy + 52, C_RED);
     tft.drawLine(cx + 52 + t, cy - 52, cx - 52 + t, cy + 52, C_RED);
@@ -307,7 +330,7 @@ void screenNotFound() {
 
   tft.setTextDatum(MC_DATUM);
 
-  // "Face Not Registered" — font 4, inside panel
+  // "Face Not Registered" — font 4, y = cy+68
   clearText(40, cy + 68, 400, 4, C_PANEL_RED);
   tft.setTextColor(C_RED, C_PANEL_RED);
   tft.drawString("Face Not Registered", cx, cy + 68, 4);
@@ -327,16 +350,16 @@ void screenNotFound() {
 //  SCREEN: Marking Attendance
 // ═══════════════════════════════════════════════════════════════════
 void screenMarking() {
-  tft.fillScreen(C_BG);
+  wipeScreen();
   drawHeader("Marking Attendance", C_YELLOW);
   tft.setTextDatum(MC_DATUM);
 
-  // "Please wait..." — font 4
-  clearText(0, 150, 480, 4, C_BG);
+  // "Please wait..." — font 4, y=150
+  clearText(0, 150, DISP_W, 4, C_BG);
   tft.setTextColor(C_WHITE, C_BG);
   tft.drawString("Please wait...", 240, 150, 4);
 
-  // Name — font 2
+  // Name — font 2, y=196
   clearText(40, 196, 400, 2, C_BG);
   tft.setTextColor(C_YELLOW, C_BG);
   tft.drawString(recognizedName.c_str(), 240, 196, 2);
@@ -348,16 +371,16 @@ void screenMarking() {
 //  SCREEN: Confirmed
 // ═══════════════════════════════════════════════════════════════════
 void screenConfirmed() {
-  tft.fillScreen(C_BG);
+  wipeScreen();
   drawHeader("Attendance Marked!", C_GREEN);
   int cx = 240;
 
-  // Panel: y=52 … y=280
+  // Panel y=52…280
   tft.fillRoundRect(20, 52, 440, 228, 16, C_PANEL_GREEN);
   tft.drawRoundRect(20, 52, 440, 228, 16, C_GREEN);
   tft.drawRoundRect(22, 54, 436, 224, 16, 0x00A0);
 
-  // Silhouette / tick graphic
+  // Silhouette graphic
   int sx = cx, sy = 70, sr = 42;
   tft.fillRoundRect(sx - sr, sy, sr * 2, (int)(sr * 1.4), 10, C_GREEN);
   for (int i = 0; i <= sr; i++)
@@ -369,18 +392,18 @@ void screenConfirmed() {
 
   tft.setTextDatum(MC_DATUM);
 
-  // "Attendance Recorded" — font 2, inside panel
+  // "Attendance Recorded" — font 2, y=172
   clearText(20, 172, 440, 2, C_PANEL_GREEN);
   tft.setTextColor(C_GREEN, C_PANEL_GREEN);
   tft.drawString("Attendance Recorded", cx, 172, 2);
   tft.drawFastHLine(60, 184, 360, C_GREEN);
 
-  // Name — font 4, inside panel
+  // Name — font 4, y=205 (SAME y for clear and draw)
   clearText(20, 205, 440, 4, C_PANEL_GREEN);
   tft.setTextColor(C_WHITE, C_PANEL_GREEN);
   tft.drawString(recognizedName.c_str(), cx, 205, 4);
 
-  // "Verified" — font 2, inside panel
+  // "Verified" — font 2, y=240
   clearText(20, 240, 440, 2, C_PANEL_GREEN);
   tft.setTextColor(C_GREEN, C_PANEL_GREEN);
   tft.drawString("Verified via Face Recognition", cx, 240, 2);
@@ -391,7 +414,7 @@ void screenConfirmed() {
     tft.drawString("Loading timetable...", cx, 262, 2);
   }
 
-  // Section/day — font 1, below panel → bg=C_BG
+  // Section/day — font 1, y=290, below panel → bg=C_BG
   clearText(20, 290, 440, 1, C_BG);
   tft.setTextColor(C_GRAY, C_BG);
   tft.drawString("Section " + ttSection + "  |  " + ttDay, cx, 290, 1);
@@ -403,11 +426,11 @@ void screenConfirmed() {
 //  SCREEN: Timetable
 // ═══════════════════════════════════════════════════════════════════
 void screenTimetable() {
-  tft.fillScreen(C_BG);
+  wipeScreen();
 
-  // Header bar (TL_DATUM — no clearText needed, drawn fresh each time)
-  tft.fillRect(0, 0, 480, 46, C_SURF);
-  tft.drawFastHLine(0, 46, 480, C_BLUE);
+  // Header bar (TL_DATUM — static, no clearText needed)
+  tft.fillRect(0, 0, DISP_W, 46, C_SURF);
+  tft.drawFastHLine(0, 46, DISP_W, C_BLUE);
   tft.setTextColor(C_BLUE, C_SURF);
   tft.drawString("Today's Timetable", 10, 8, 2);
   String sub = ttDay + "  |  Sec " + ttSection + "  |  " + recognizedName.substring(0, 18);
@@ -424,12 +447,12 @@ void screenTimetable() {
   }
 
   // Column header bar
-  tft.fillRect(0, 47, 480, 18, C_SURF2);
+  tft.fillRect(0, 47, DISP_W, 18, C_SURF2);
   tft.setTextColor(C_GRAY, C_SURF2);
   tft.drawString("Per  Time",  8,   51, 1);
   tft.drawString("Subject",    148, 51, 1);
   tft.drawString("Teacher",    310, 51, 1);
-  tft.drawFastHLine(0, 65, 480, C_SURF);
+  tft.drawFastHLine(0, 65, DISP_W, C_SURF);
 
   uint16_t stripeColors[] = {C_BLUE, C_GREEN, C_YELLOW, C_ORANGE, 0x07FF, C_RED};
   int maxRows = min(ttCount, 3);
@@ -440,35 +463,35 @@ void screenTimetable() {
     uint16_t bg     = (i % 2 == 0) ? 0x080A : C_BG;
     uint16_t stripe = stripeColors[i % 6];
 
-    // Fill entire row background FIRST — erases all prior content
-    tft.fillRect(0, y, 480, rowH - 1, bg);
+    // Fill full row bg FIRST — erases all previous content
+    tft.fillRect(0, y, DISP_W, rowH - 1, bg);
     tft.fillRect(0, y, 5, rowH - 1, stripe);
-
-    // Period pill — small label centred in pill
     tft.fillRoundRect(8, y + 6, 28, rowH - 14, 4, stripe);
+
+    // Period pill — MC_DATUM for centering in pill
     tft.setTextColor(C_BG, stripe);
     tft.setTextDatum(MC_DATUM);
     tft.drawString(tt[i].label.c_str(), 22, y + rowH / 2, 1);
     tft.setTextDatum(TL_DATUM);
 
-    // Time, Subject, Teacher drawn on already-filled row bg
+    // Row text — TL_DATUM, drawn on already-filled row bg
     tft.setTextColor(C_GRAY,  bg);
-    tft.drawString(tt[i].time.c_str(),                        42,  y + 6, 1);
+    tft.drawString(tt[i].time.c_str(),                       42, y + 6, 1);
     tft.setTextColor(C_WHITE, bg);
-    tft.drawString(tt[i].subject.substring(0, 18).c_str(),   148, y + 6, 2);
+    tft.drawString(tt[i].subject.substring(0, 18).c_str(), 148, y + 6, 2);
     tft.setTextColor(C_GRAY,  bg);
-    tft.drawString(tt[i].teacher.substring(0, 24).c_str(),   310, y + 6, 1);
+    tft.drawString(tt[i].teacher.substring(0, 24).c_str(), 310, y + 6, 1);
 
-    tft.drawFastHLine(0, y + rowH - 1, 480, C_SURF);
+    tft.drawFastHLine(0, y + rowH - 1, DISP_W, C_SURF);
     y += rowH;
   }
 
-  tft.drawFastHLine(0, y + 2, 480, C_SURF);
+  tft.drawFastHLine(0, y + 2, DISP_W, C_SURF);
   tft.setTextColor(C_BLUE, C_BG);
   tft.drawString(String(min(ttCount, 3)) + "/" + String(ttCount) + " periods shown", 8, y + 6, 1);
 
-  // Countdown — initial draw; loop updates it once per second
-  tft.fillRect(0, 298, 480, 22, C_BG);
+  // Countdown — initial draw (loop updates it once per second)
+  tft.fillRect(0, 298, DISP_W, 22, C_BG);
   tft.setTextColor(C_GRAY, C_BG);
   tft.setTextDatum(MC_DATUM);
   unsigned long secLeft = (TIMETABLE_MS - inState()) / 1000;
@@ -480,7 +503,7 @@ void screenTimetable() {
 //  SCREEN: Network Error
 // ═══════════════════════════════════════════════════════════════════
 void screenFailed() {
-  tft.fillScreen(C_BG);
+  wipeScreen();
   drawHeader("Connection Error", C_RED);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(C_RED,  C_BG);
@@ -497,11 +520,13 @@ void screenFailed() {
 // ═══════════════════════════════════════════════════════════════════
 bool pollServer() {
   if (WiFi.status() != WL_CONNECTED) return false;
+
   HTTPClient http;
   http.begin(buildURL("/api/esp32/poll"));
   http.setTimeout(2000);
   int code = http.GET();
   if (code != 200) { http.end(); return false; }
+
   String body = http.getString();
   http.end();
 
@@ -513,20 +538,14 @@ bool pollServer() {
   float       conf = doc["confidence"] | 0.0f;
 
   if (strcmp(sv, "face_detected") == 0 && strlen(name) > 0 && strcmp(name, "Unknown") != 0) {
-    if (String(name) == lastStableName) {
-      stableCount++;
-    } else {
-      lastStableName = String(name);
-      stableCount    = 1;
-    }
+    if (String(name) == lastStableName) stableCount++;
+    else { lastStableName = String(name); stableCount = 1; }
     recognizedName = String(name);
     recognizedConf = conf;
     if (stableCount >= STABLE_POLLS && state == S_IDLE) return true;
 
   } else if (strcmp(sv, "not_registered") == 0 && state == S_IDLE) {
-    recognizedName = "";
-    stableCount    = 0;
-    lastStableName = "";
+    recognizedName = ""; stableCount = 0; lastStableName = "";
     setState(S_NOTFOUND);
     screenNotFound();
 
@@ -540,11 +559,8 @@ bool pollServer() {
 //  API: POST /api/attendance/mark
 // ═══════════════════════════════════════════════════════════════════
 void markAttendance() {
-  if (WiFi.status() != WL_CONNECTED) {
-    setState(S_FAILED);
-    screenFailed();
-    return;
-  }
+  if (WiFi.status() != WL_CONNECTED) { setState(S_FAILED); screenFailed(); return; }
+
   setState(S_MARKING);
   screenMarking();
 
@@ -562,10 +578,7 @@ void markAttendance() {
   int code = http.POST(body);
   if (code != 200) {
     Serial.printf("[ATT] HTTP error: %d\n", code);
-    http.end();
-    setState(S_FAILED);
-    screenFailed();
-    return;
+    http.end(); setState(S_FAILED); screenFailed(); return;
   }
 
   String resp = http.getString();
@@ -574,9 +587,7 @@ void markAttendance() {
   DynamicJsonDocument doc(4096);
   if (deserializeJson(doc, resp)) {
     Serial.println("[ATT] JSON parse failed");
-    setState(S_CONFIRMED);
-    screenConfirmed();
-    return;
+    setState(S_CONFIRMED); screenConfirmed(); return;
   }
 
   ttCount = 0; ttDay = ""; ttSection = "";
@@ -616,7 +627,7 @@ void webRoot() {
     "<title>FaceGuard ESP32</title>"
     "<style>body{font-family:monospace;background:#0a0f1e;color:#e2e8f0;padding:20px}"
     "h1{color:#4f8ef7}td{padding:6px 16px}th{text-align:left;color:#4a6fa5}"
-    ".g{color:#22d3a0}.r{color:#f45454}</style></head><body>"
+    ".g{color:#22d3a0}.r{color:#f45454}.y{color:#f7c154}</style></head><body>"
     "<h1>FaceGuard Kiosk</h1><table>"
     "<tr><th>State</th><td class='g'>"  + String(stateNames[(int)state])                   + "</td></tr>"
     "<tr><th>Detected</th><td>"         + (recognizedName.length() ? recognizedName : "—") + "</td></tr>"
@@ -624,7 +635,7 @@ void webRoot() {
     "<tr><th>Server</th><td>"           + SERVER_IP + ":" + SERVER_PORT                    + "</td></tr>"
     "<tr><th>WiFi IP</th><td>"          + WiFi.localIP().toString()                        + "</td></tr>"
     "<tr><th>Uptime</th><td>"           + String(millis() / 1000)                          + "s</td></tr>"
-    "</table><p style='color:#4a6568;font-size:12px'>Auto-refreshes every 3s</p>"
+    "</table><p style='color:#4a5568;font-size:12px'>Auto-refreshes every 3s</p>"
     "</body></html>";
   localWeb.send(200, "text/html", html);
 }
@@ -635,11 +646,18 @@ void webRoot() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+
   tft.init();
   tft.setRotation(1);
-  tft.fillScreen(C_BG);
+  wipeScreen();                            // clean slate from power-on
   tft.setTextWrap(false);
   Serial.println("[TFT] OK");
+
+  // ── [HW FIX 1] Disable WiFi modem-sleep ─────────────────────
+  // This stops the radio from bursting power in short spikes that
+  // can couple into the SPI lines and corrupt display writes.
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
   setState(S_WIFI);
   screenWifi();
@@ -648,7 +666,7 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int dots = 0;
-  while (WiFi.status() != WL_CONNECTED && dots < 60) {  // 30s timeout
+  while (WiFi.status() != WL_CONNECTED && dots < 60) {
     delay(500);
     updateWifiDots(dots);
     dots++;
@@ -657,15 +675,24 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("\n[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
+    wipeScreen();
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_GREEN, C_BG);
+    tft.drawString("WiFi Connected!", 240, 160, 4);
+    tft.setTextColor(C_GRAY, C_BG);
+    tft.drawString(WiFi.localIP().toString(), 240, 205, 2);
+    tft.setTextDatum(TL_DATUM);
+    delay(1200);
   } else {
     Serial.println("\n[WiFi] FAILED");
-    tft.fillRect(0, 230, 480, 90, C_BG);
-    tft.setTextColor(C_RED, C_BG);
+    wipeScreen();
     tft.setTextDatum(MC_DATUM);
-    tft.drawString("WiFi FAILED — check credentials", 240, 260, 2);
+    tft.setTextColor(C_RED, C_BG);
+    tft.drawString("WiFi FAILED", 240, 160, 4);
+    tft.setTextColor(C_GRAY, C_BG);
+    tft.drawString("Check SSID / password", 240, 205, 2);
     tft.setTextDatum(TL_DATUM);
     delay(5000);
-    // Falls through to screenIdle() — screen is never left on WiFi bg
   }
 
   localWeb.on("/", webRoot);
@@ -674,7 +701,7 @@ void setup() {
   Serial.printf("[Config] Flask: http://%s:%d\n", SERVER_IP, SERVER_PORT);
 
   setState(S_IDLE);
-  screenIdle();                                  // always clears WiFi screen
+  screenIdle();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -686,12 +713,10 @@ void loop() {
 
   switch (state) {
 
-    // ── Idle: poll server every POLL_MS ──────────────────────────
     case S_IDLE:
       if (now - lastPoll >= POLL_MS) {
         lastPoll = now;
-        bool faceConfirmed = pollServer();
-        if (faceConfirmed) {
+        if (pollServer()) {
           setState(S_FACE);
           screenFace();
           delay(1400);
@@ -700,69 +725,57 @@ void loop() {
       }
       break;
 
-    // ── Not found: auto-dismiss ───────────────────────────────────
     case S_NOTFOUND:
       if (inState() >= NOTFOUND_MS) {
-        stableCount    = 0;
-        lastStableName = "";
-        recognizedName = "";
+        stableCount = 0; lastStableName = ""; recognizedName = "";
         setState(S_IDLE);
-        screenIdle();                            // clears not-found screen
+        screenIdle();
       }
       break;
 
-    // ── Confirmed: wait, then timetable or idle ───────────────────
     case S_CONFIRMED:
       if (inState() >= CONFIRMED_MS) {
         if (ttCount > 0) {
           setState(S_TIMETABLE);
           screenTimetable();
         } else {
-          stableCount    = 0;
-          lastStableName = "";
-          recognizedName = "";
+          stableCount = 0; lastStableName = ""; recognizedName = "";
           setState(S_IDLE);
-          screenIdle();                          // clears confirmed screen
+          screenIdle();
         }
       }
       break;
 
-    // ── Timetable: tick countdown once/second, then idle ─────────
     case S_TIMETABLE: {
       static unsigned long lastTTSec = 0;
       unsigned long curSec = millis() / 1000;
-      if (curSec != lastTTSec) {               // fires exactly once per second
+      if (curSec != lastTTSec) {             // fires exactly once per second
         lastTTSec = curSec;
         unsigned long secLeft = (TIMETABLE_MS - inState()) / 1000;
-        tft.fillRect(0, 298, 480, 22, C_BG);   // full-width clear
+        tft.startWrite();
+        tft.fillRect(0, 298, DISP_W, 22, C_BG);
+        tft.endWrite();
         tft.setTextColor(C_GRAY, C_BG);
         tft.setTextDatum(MC_DATUM);
         tft.drawString("Auto-reset in " + String(secLeft) + "s", 240, 308, 1);
         tft.setTextDatum(TL_DATUM);
       }
       if (inState() >= TIMETABLE_MS) {
-        stableCount    = 0;
-        lastStableName = "";
-        recognizedName = "";
-        ttCount        = 0;
+        stableCount = 0; lastStableName = ""; recognizedName = ""; ttCount = 0;
         setState(S_IDLE);
-        screenIdle();                            // clears timetable screen
+        screenIdle();
       }
       break;
     }
 
-    // ── Failed: auto-dismiss ──────────────────────────────────────
     case S_FAILED:
       if (inState() >= FAILED_MS) {
-        stableCount    = 0;
-        lastStableName = "";
-        recognizedName = "";
+        stableCount = 0; lastStableName = ""; recognizedName = "";
         setState(S_IDLE);
-        screenIdle();                            // clears error screen
+        screenIdle();
       }
       break;
 
-    // ── Blocking states (managed by their own functions) ─────────
     case S_MARKING:
     case S_FACE:
     case S_WIFI:
