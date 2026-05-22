@@ -726,6 +726,7 @@ void loop() {
         screenIdle();
       }
       break;
+    }                  // ← closes  case S_TIMETABLE: {
 
     case S_FAILED:
       if (inState() >= FAILED_MS) {
